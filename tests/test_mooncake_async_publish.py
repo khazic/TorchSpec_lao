@@ -54,6 +54,26 @@ def test_eagle_raw_put_validates_then_delegates():
     store._put_raw_tensors.assert_called_once_with(keys, tensors)
 
 
+def test_gpu_direct_put_waits_for_staging_before_rdma_read():
+    store = object.__new__(EagleMooncakeStore)
+    store._gpu_direct_available = True
+    store._gpu_send_buffer = MagicMock(ptr=123, device="cuda:0")
+    store._stage_tensors_into_buffer = MagicMock(return_value=([123], [8]))
+    events = []
+    stream = MagicMock()
+    stream.synchronize.side_effect = lambda: events.append("staging complete")
+    store._do_sync_batch_put = MagicMock(side_effect=lambda *_: events.append("rdma put"))
+
+    with patch(
+        "torchspec.transfer.mooncake.eagle_store.torch.cuda.current_stream",
+        return_value=stream,
+    ) as current_stream:
+        store._put_raw_tensors(["key"], [MagicMock()])
+
+    current_stream.assert_called_once_with("cuda:0")
+    assert events == ["staging complete", "rdma put"]
+
+
 def test_async_error_check_does_not_wait_for_running_put():
     manager = AsyncPutManager(MagicMock(), max_workers=1)
     pending = Future()
@@ -202,3 +222,38 @@ def test_host_buffer_copy_is_non_blocking():
 
     assert buffer.copy_from_tensor(Tensor(), offset=4) == 8
     assert copied["non_blocking"] is True
+
+
+def test_registered_multi_buffer_put_delegates_with_replicate_config():
+    raw_store = MagicMock(spec=["batch_put_from_multi_buffers", "batch_remove"])
+    raw_store.batch_put_from_multi_buffers.return_value = [0, 0]
+    store = _make_store(raw_store)
+    store._replicate_config = MagicMock()
+
+    store.put_from_registered_multi_buffers(
+        ["layer2", "layer46"],
+        [[100, 200], [300]],
+        [[64, 32], [96]],
+    )
+
+    raw_store.batch_put_from_multi_buffers.assert_called_once_with(
+        ["layer2", "layer46"],
+        [[100, 200], [300]],
+        [[64, 32], [96]],
+        config=store._replicate_config,
+    )
+
+
+def test_registered_multi_buffer_put_cleans_partial_failure():
+    raw_store = MagicMock(spec=["batch_put_from_multi_buffers", "batch_remove"])
+    raw_store.batch_put_from_multi_buffers.return_value = [0, -600]
+    store = _make_store(raw_store)
+
+    with pytest.raises(RuntimeError, match=r"layer46 \(code=-600\)"):
+        store.put_from_registered_multi_buffers(
+            ["layer2", "layer46"],
+            [[100], [200]],
+            [[64], [64]],
+        )
+
+    raw_store.batch_remove.assert_called_once_with(["layer2", "layer46"], force=True)
